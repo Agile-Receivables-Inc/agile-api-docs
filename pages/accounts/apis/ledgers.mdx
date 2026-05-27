@@ -1,0 +1,282 @@
+import { Callout } from 'nextra-theme-docs'
+
+# Ledgers API
+
+Use the Ledgers API to push raw transaction records (charges, payments, adjustments) into Agile
+Receivables. The server upserts ledger entries by `external_id` and immediately re-runs the
+**statement aggregator**, which materializes one monthly statement-invoice per
+`(customer, calendar month)` with positive net charges. Read more about statements in
+[Statements API](/accounts/apis/statements).
+
+## Concepts
+
+| Term            | What it is                                                                                                                                                                  |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ledger entry    | A single raw transaction record — a charge, a payment, or an adjustment for one patient. Third parties push these directly.                                                  |
+| Statement       | A monthly invoice aggregated server-side from ledger entries. Third parties **do not create** statements — they push ledger entries and the server materializes statements. |
+| Payment waterfall | Patient and insurance payments are allocated across statements **oldest-first**. The server writes synthetic `payment_allocation` rows to record each split.              |
+
+### How ledger push -> statement aggregation works
+
+1. Client `POST`s ledger entries via `/external/ledgers/bulk`.
+2. Server upserts each entry by `(company_id, external_id)`.
+3. Server immediately runs the statement aggregator (same code path as Sikka sync):
+   - For every month with positive net charges, creates or updates one statement-invoice.
+   - Allocates patient and insurance payments across statements oldest-first.
+   - Sets `paid_amount` on each statement based on its share of allocated payments.
+4. Response returns counts for both ledger entries and statements.
+
+<Callout type="info">
+  There is **no auto-enrollment** — newly created statements sit at `status="not_assigned"`. The
+  caller must call the statement enrollment endpoints to enroll them into a
+  Statement-Acknowledgement campaign. See [Statements API](/accounts/apis/statements).
+</Callout>
+
+## Endpoints
+
+| Method | Path                            | Scope            | Description                                                                       |
+| ------ | ------------------------------- | ---------------- | --------------------------------------------------------------------------------- |
+| POST   | `/ledgers/bulk`                 | `ledgers:write`  | Bulk upsert up to 500 ledger entries by `external_id`, then re-aggregate statements. |
+| POST   | `/ledgers/batch`                | `ledgers:write`  | Alias for `/ledgers/bulk`. Same body, response, and scope.                        |
+| GET    | `/ledgers`                      | `ledgers:read`   | List ledger entries with filters and pagination.                                  |
+| GET    | `/ledgers/{ledger_id}`          | `ledgers:read`   | Get a single ledger entry by internal UUID.                                       |
+
+Scope behavior and empty-scope full-access rules are documented in **Core Concepts -> Authentication**.
+
+## Sandbox behavior
+
+- `sk_test_*` keys can read/write only sandbox data; `sk_live_*` only live data.
+- Ledger entries inherit sandbox status from their linked customer — cross-mode customer
+  references are blocked at insert time.
+
+## Request fields — `ExternalLedgerEntryRecord`
+
+| Field                  | Type                | Required                                                                                        | Description                                                                                          |
+| ---------------------- | ------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `external_id`          | string (1-100)      | yes                                                                                             | Unique transaction ID per company. Upsert key.                                                       |
+| `customer_id`          | UUID                | one of `customer_id` / `customer_external_id` required                                          | Internal customer UUID.                                                                              |
+| `customer_external_id` | string (max 255)    | one of `customer_id` / `customer_external_id` required                                          | External customer ID — resolved to internal UUID within the same sandbox scope.                      |
+| `transaction_date`     | date (`YYYY-MM-DD`) | yes                                                                                             | Drives which monthly statement this rolls into.                                                      |
+| `transaction_type`     | string enum         | yes                                                                                             | One of: `charge`, `insurance_payment`, `patient_payment`, `adjustment`, `other_debit`, `other_credit`. |
+| `amount`               | number              | yes                                                                                             | **Positive** for charges and adjustments. **Negative** for payments.                                 |
+| `amount_paid`          | number              | no                                                                                              | Cumulative paid on this transaction (Sikka parity).                                                  |
+| `estimated_insurance`  | number              | no                                                                                              | Sikka estimate field.                                                                                |
+| `payment_link_id`      | string (max 100)    | no                                                                                              | Links a payment record to the procedure it pays (Sikka parity).                                      |
+| `procedure_code`       | string (max 50)     | no                                                                                              | For example, `D0120`.                                                                                |
+| `description`          | string              | no                                                                                              | Human-readable description.                                                                          |
+
+## Bulk upsert ledger entries
+
+`POST /api/v1/external/ledgers/bulk` (and the alias `POST /api/v1/external/ledgers/batch`) upsert
+up to **500** ledger entries by `external_id` and then re-aggregate the affected statements.
+
+- **Scope:** `ledgers:write`
+- **Idempotent:** yes — re-pushing the same `external_id` updates the existing row (counted as `updated`).
+
+### cURL
+
+```bash
+curl --request POST \
+  --url https://api.agilereceivables.com/api/v1/external/ledgers/bulk \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx' \
+  --header 'Content-Type: application/json' \
+  --data '{
+  "ledger_entries": [
+    {
+      "external_id": "TX-2026-05-001",
+      "customer_external_id": "PT-001",
+      "transaction_date": "2026-05-03",
+      "transaction_type": "charge",
+      "amount": 240.00,
+      "procedure_code": "D0120",
+      "description": "Periodic oral evaluation"
+    },
+    {
+      "external_id": "TX-2026-05-002",
+      "customer_external_id": "PT-001",
+      "transaction_date": "2026-05-15",
+      "transaction_type": "patient_payment",
+      "amount": -100.00,
+      "description": "Patient payment"
+    }
+  ]
+}'
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Ledger entries processed",
+  "data": {
+    "ledger_entries": {
+      "total": 2,
+      "created": 2,
+      "updated": 0,
+      "skipped": 0,
+      "failed": 0,
+      "errors": []
+    },
+    "statements": {
+      "total": 1,
+      "created": 1,
+      "updated": 0,
+      "skipped": 0,
+      "failed": 0,
+      "allocations_created": 1
+    }
+  }
+}
+```
+
+- `ledger_entries.errors[]` items use the shape `{ "index": 0, "external_id": "TX-...", "error": "..." }`.
+- `statements.created` and `updated` reflect the monthly statement-invoices materialized from the
+  just-pushed entries.
+- `statements.allocations_created` is the number of synthetic `payment_allocation` ledger entries
+  written by the waterfall (one per payment-source x destination-statement split).
+
+### Errors
+
+| Status | Cause                                                                                |
+| ------ | ------------------------------------------------------------------------------------ |
+| 400    | `customer_id or a resolvable customer_external_id is required for ledger entries` (per-record error in `errors[]`). |
+| 403    | API key lacks `ledgers:write` scope.                                                 |
+| 422    | Invalid `transaction_type` or missing required field.                                |
+
+<Callout type="info">
+  `POST /ledgers/batch` is an exact alias for `/ledgers/bulk`. It exists to mirror the
+  `/invoices/batch` &lt;-&gt; `/accounts/bulk` duality on the invoice side. Use whichever convention your
+  client prefers.
+</Callout>
+
+## List ledger entries
+
+```bash
+curl --request GET \
+  --url 'https://api.agilereceivables.com/api/v1/external/ledgers?page=1&per_page=50' \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx'
+```
+
+- **Scope:** `ledgers:read`
+- Sorted by `transaction_date DESC, created_at DESC`.
+
+### Query parameters
+
+| Param                  | Type    | Default | Description                                                |
+| ---------------------- | ------- | ------- | ---------------------------------------------------------- |
+| `customer_id`          | UUID    | —       | Filter by internal customer UUID.                          |
+| `customer_external_id` | string  | —       | Filter by external customer ID (resolved server-side).     |
+| `from_date`            | date    | —       | Inclusive lower bound on `transaction_date`.               |
+| `to_date`              | date    | —       | Inclusive upper bound on `transaction_date`.               |
+| `transaction_type`     | string  | —       | Exact match — for example, `charge`.                       |
+| `page`                 | integer | `1`     | Page number, min `1`.                                      |
+| `per_page`             | integer | `50`    | Results per page, min `1`, max `200`.                      |
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Ledger entries retrieved",
+  "data": {
+    "entries": [
+      {
+        "id": "8b3f...",
+        "company_id": "...",
+        "customer_id": "...",
+        "invoice_id": "...",
+        "external_id": "TX-2026-05-001",
+        "transaction_date": "2026-05-03",
+        "transaction_type": "charge",
+        "amount": 240.0,
+        "amount_paid": null,
+        "estimated_insurance": null,
+        "payment_link_id": null,
+        "procedure_code": "D0120",
+        "description": "Periodic oral evaluation",
+        "created_at": "2026-05-27T10:14:02.331Z",
+        "updated_at": "2026-05-27T10:14:02.331Z"
+      }
+    ],
+    "total": 1,
+    "page": 1,
+    "per_page": 50,
+    "total_pages": 1
+  }
+}
+```
+
+`invoice_id` is the statement this entry rolls into. It is `null` until aggregation has run.
+
+## Get a single ledger entry
+
+`GET /api/v1/external/ledgers/{ledger_id}` returns a single ledger entry by internal UUID.
+
+- **Scope:** `ledgers:read`
+- Returns `404` if not found, wrong company, or wrong sandbox mode.
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Ledger entry retrieved",
+  "data": {
+    "id": "8b3f...",
+    "customer_id": "...",
+    "external_id": "TX-2026-05-001",
+    "transaction_date": "2026-05-03",
+    "transaction_type": "charge",
+    "amount": 240.0,
+    "procedure_code": "D0120",
+    "description": "Periodic oral evaluation"
+  }
+}
+```
+
+The shape matches one entry from the list endpoint above.
+
+## Combined sync (extended)
+
+The existing combined-sync endpoint, `POST /api/v1/external/sync`, now also accepts
+`ledger_entries` and runs the aggregator at the end of the pipeline. The processing order is
+customers -> invoices -> ledger entries -> statement aggregation.
+
+- **Scope:** `sync:write`
+- All three list fields are optional, but at least one must be non-empty.
+
+### Request body
+
+```json
+{
+  "customers":      [ /* ExternalCustomerRecord[] (max 100) — same as before */ ],
+  "invoices":       [ /* ExternalInvoiceRecord[]  (max 100) — same as before */ ],
+  "ledger_entries": [ /* ExternalLedgerEntryRecord[] (max 500) — see /ledgers/bulk schema */ ]
+}
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Sync completed successfully",
+  "data": {
+    "customers":      { "total": 0, "created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": [] },
+    "invoices":       { "total": 0, "created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": [] },
+    "ledger_entries": { "total": 2, "created": 2, "updated": 0, "skipped": 0, "failed": 0, "errors": [] },
+    "statements":     { "total": 1, "created": 1, "updated": 0, "skipped": 0, "failed": 0, "allocations_created": 1 }
+  }
+}
+```
+
+`statements` is only non-zero when `ledger_entries` were provided — the aggregator runs only after
+a ledger push.
+
+## Known limitations
+
+- **No `PUT`/`DELETE` on individual ledger entries** — only bulk upsert. Pushing the same
+  `external_id` with new values is the way to correct an entry.
+- **No `PUT`/`DELETE` on statements** — statements are derived from ledger entries. To remove or
+  change a statement, modify the underlying ledger entries and re-push.

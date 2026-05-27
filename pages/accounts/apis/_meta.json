@@ -1,6 +1,8 @@
 {
   "customers": "Customers",
   "accounts": "Accounts",
+  "ledgers": "Ledgers",
+  "statements": "Statements",
   "campaigns": "Campaigns",
   "payments": "Payments",
   "disputes": "Disputes"

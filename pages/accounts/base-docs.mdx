@@ -21,6 +21,9 @@ curl --request GET \
   - `customers:read`, `customers:write`
   - `campaigns:read`, `campaigns:write`
   - `disputes:read`, `disputes:write`
+  - `ledgers:read`, `ledgers:write`
+  - `statements:read`, `statements:write`
+  - `sync:write`
 - An API key with an **empty scope list** has full access (no restriction).
 - Restriction applies only when scopes are explicitly set.
 
@@ -127,6 +130,8 @@ Some endpoints define additional filters, for example:
 - Accounts: `search`, `status`, `customer_id`, `overdue_only`, `amount_min`, `amount_max`.
 - Campaigns: `search`, `status`, `type`.
 - Disputes: `status`, `customer_id`.
+- Ledgers: `customer_id`, `customer_external_id`, `from_date`, `to_date`, `transaction_type` (per-page max 200).
+- Statements: `customer_id`, `customer_external_id`, `status`, `from_date`, `to_date`.
 
 ## Rate limiting
 
@@ -143,7 +148,10 @@ There is no separate test-vs-live key rate limit behavior, and no per-tenant/per
 
 <Callout type="info">
   Sandbox/live behavior is controlled by record-level `is_sandbox` flags, not by API key type.
-  Sandbox accounts cannot be enrolled in campaigns.
+  Sandbox accounts cannot be enrolled in campaigns. Sandbox keys are also blocked from enrolling
+  statements into Statement-Acknowledgement campaigns — these endpoints return `400` for
+  `sk_test_*` keys. The sandbox data-purge endpoint (`/sandbox/data`) clears ledger entries
+  alongside customers and invoices.
 </Callout>
 
 ## Typical integration flow
@@ -161,4 +169,21 @@ The following high-level flow is common when integrating with Agile Receivables:
 
 4. **Record payments and reconcile**  
    Use the **Payments** endpoints to record payments and track outstanding balances, then use your own systems to reconcile these with bank or processor statements.
+
+### Ledger-driven integrations (Sikka-style)
+
+When the source system pushes raw transaction-level data instead of pre-built invoices, the flow is:
+
+1. **Push customers** with the **Customers** endpoints.
+2. **Push ledger entries** with the **Ledgers** endpoints (`POST /ledgers/bulk`). The server
+   upserts each entry and immediately runs the statement aggregator — one monthly statement per
+   `(customer, calendar month)` is created or updated, with payments allocated across statements
+   oldest-first.
+3. **Read back statements** with the **Statements** endpoints to confirm what was materialized.
+4. **Enroll statements into a Statement-Acknowledgement campaign** with
+   `POST /statements/{id}/campaign` (or the bulk variant). SA campaigns must be created in-app.
+
+The combined-sync endpoint `POST /api/v1/external/sync` also accepts `ledger_entries` in addition
+to `customers` and `invoices`. The aggregator runs at the end of the pipeline whenever
+`ledger_entries` are included.
 

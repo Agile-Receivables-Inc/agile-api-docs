@@ -1,0 +1,346 @@
+import { Callout } from 'nextra-theme-docs'
+
+# Statements API
+
+Statements are **monthly invoices aggregated server-side** from ledger entries. One statement is
+materialized per `(customer, calendar month)` with positive net charges. Statements are not
+created directly by clients — push raw transactions via the [Ledgers API](/accounts/apis/ledgers)
+and the server materializes statements automatically.
+
+Statements can only be enrolled into campaigns with `category="statement_acknowledgement"` (SA
+campaigns). The regular `payment_reminder` flow does not apply.
+
+## Endpoints
+
+| Method | Path                                          | Scope               | Description                                                          |
+| ------ | --------------------------------------------- | ------------------- | -------------------------------------------------------------------- |
+| GET    | `/statements`                                 | `statements:read`   | List statement-invoices with filters and pagination.                 |
+| GET    | `/statements/{statement_id}`                  | `statements:read`   | Get a single statement, optionally with the ledger entries that compose it. |
+| POST   | `/statements/{statement_id}/campaign`         | `statements:write`  | Enroll a single statement into a Statement-Acknowledgement campaign. |
+| POST   | `/statements/campaign/bulk`                   | `statements:write`  | Bulk-enroll up to 100 statements into one SA campaign.               |
+
+Scope behavior and empty-scope full-access rules are documented in **Core Concepts -> Authentication**.
+
+<Callout type="warning">
+  **Sandbox keys cannot enroll statements into campaigns.** The enrollment endpoints return `400`
+  for `sk_test_*` keys, because campaigns send real communications.
+</Callout>
+
+## Statement fields
+
+| Field                  | Type    | Description                                                                                          |
+| ---------------------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `id`                   | UUID    | Internal statement UUID.                                                                             |
+| `customer_id`          | UUID    | Customer the statement belongs to.                                                                   |
+| `external_invoice_id`  | string  | Format: `STMT-{YYYY}-{MM}-{customer_external_id}`.                                                   |
+| `invoice_number`       | string  | Mirrors `external_invoice_id`.                                                                       |
+| `billing_type`         | string  | Always `statement` for records returned by this API.                                                 |
+| `amount`               | number  | Total net charges for the month.                                                                     |
+| `paid_amount`          | number  | Sum of payments allocated to this statement via the oldest-first waterfall.                          |
+| `outstanding`          | number  | `amount - paid_amount`.                                                                              |
+| `currency`             | string  | ISO currency code (default `USD`).                                                                   |
+| `status`               | string  | See status values below.                                                                             |
+| `enrollment_status`    | string  | `not_enrolled` until an SA-campaign enrollment is created.                                           |
+| `period_start`         | date    | First day of the statement month.                                                                    |
+| `period_end`           | date    | Last day of the statement month.                                                                     |
+| `issue_date`           | date    | Same as `period_start`.                                                                              |
+| `due_date`             | date    | `period_start + uncollectible_threshold_days` (180 days by default for API-imported data).            |
+| `source`               | string  | `api` for API-imported statements.                                                                   |
+| `campaign_id`          | UUID    | The SA campaign the statement is enrolled into, if any.                                              |
+
+### Status values
+
+`not_assigned`, `in_progress`, `pending_collection`, `disputed`, `uncollectible`, `paid_in_full`,
+`settled`.
+
+Newly-aggregated statements begin at `status="not_assigned"`. Enrolling into an SA campaign moves
+the statement to `status="in_progress"`.
+
+## List statements
+
+```bash
+curl --request GET \
+  --url 'https://api.agilereceivables.com/api/v1/external/statements?page=1&per_page=20' \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx'
+```
+
+- **Scope:** `statements:read`
+- Sorted by `period_start DESC, created_at DESC`.
+
+### Query parameters
+
+| Param                  | Type    | Default | Description                                                                                                                |
+| ---------------------- | ------- | ------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `customer_id`          | UUID    | —       | Filter by internal customer UUID.                                                                                          |
+| `customer_external_id` | string  | —       | Filter by external customer ID (resolved server-side).                                                                     |
+| `status`               | string  | —       | One of `not_assigned`, `in_progress`, `pending_collection`, `disputed`, `uncollectible`, `paid_in_full`, `settled`.         |
+| `from_date`            | date    | —       | Inclusive lower bound on `period_start`.                                                                                   |
+| `to_date`              | date    | —       | Inclusive upper bound on `period_end`.                                                                                     |
+| `page`                 | integer | `1`     | Page number, min `1`.                                                                                                      |
+| `per_page`             | integer | `20`    | Results per page, min `1`, max `100`.                                                                                      |
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Statements retrieved",
+  "data": {
+    "statements": [
+      {
+        "id": "1c5a...",
+        "company_id": "...",
+        "customer_id": "...",
+        "external_invoice_id": "STMT-2026-05-PT-001",
+        "invoice_number": "STMT-2026-05-PT-001",
+        "billing_type": "statement",
+        "amount": 240.0,
+        "paid_amount": 100.0,
+        "outstanding": 140.0,
+        "currency": "USD",
+        "status": "not_assigned",
+        "enrollment_status": "not_enrolled",
+        "period_start": "2026-05-01",
+        "period_end": "2026-05-31",
+        "due_date": "2026-10-28",
+        "issue_date": "2026-05-01",
+        "source": "api",
+        "campaign_id": null,
+        "created_at": "2026-05-27T10:14:02.500Z",
+        "updated_at": "2026-05-27T10:14:02.500Z"
+      }
+    ],
+    "total": 1,
+    "page": 1,
+    "per_page": 20,
+    "total_pages": 1
+  }
+}
+```
+
+## Get a single statement
+
+`GET /api/v1/external/statements/{statement_id}` returns one statement, with optional drill-down
+to the ledger entries that compose it.
+
+- **Scope:** `statements:read`
+- Returns `404` if not found, if the record is not a statement (`billing_type != "statement"`), or
+  if the company/sandbox mode does not match.
+
+### Query parameters
+
+| Param              | Type    | Default | Description                                          |
+| ------------------ | ------- | ------- | ---------------------------------------------------- |
+| `include_entries`  | bool    | `true`  | Include linked ledger entries in the response.       |
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Statement retrieved",
+  "data": {
+    "id": "1c5a...",
+    "customer_id": "...",
+    "external_invoice_id": "STMT-2026-05-PT-001",
+    "amount": 240.0,
+    "paid_amount": 100.0,
+    "outstanding": 140.0,
+    "status": "not_assigned",
+    "period_start": "2026-05-01",
+    "period_end": "2026-05-31",
+    "entries": [
+      {
+        "id": "8b3f...",
+        "customer_id": "...",
+        "external_id": "TX-2026-05-001",
+        "transaction_date": "2026-05-03",
+        "transaction_type": "charge",
+        "amount": 240.0,
+        "procedure_code": "D0120",
+        "description": "Periodic oral evaluation"
+      },
+      {
+        "id": "9c4a...",
+        "customer_id": "...",
+        "external_id": "ALLOC-TX-2026-05-002-1c5a...",
+        "transaction_date": "2026-05-15",
+        "transaction_type": "payment_allocation",
+        "amount": -100.0,
+        "procedure_code": null,
+        "description": null
+      }
+    ]
+  }
+}
+```
+
+The `entries` array includes both real ledger rows (charges, raw payments) and **synthetic
+`payment_allocation` rows** produced by the waterfall — those are the per-statement splits of a
+payment across one or more destination statements.
+
+## Enroll a single statement into an SA campaign
+
+`POST /api/v1/external/statements/{statement_id}/campaign` enrolls one statement into a
+Statement-Acknowledgement campaign.
+
+- **Scope:** `statements:write`
+- **Sandbox keys are blocked** — returns `400`.
+- The target campaign **must** have `category="statement_acknowledgement"` — otherwise returns
+  `400` with details.
+
+### Query parameters
+
+| Param          | Type | Required | Description              |
+| -------------- | ---- | -------- | ------------------------ |
+| `campaign_id`  | UUID | yes      | Target SA campaign UUID. |
+
+### Request body
+
+None.
+
+### cURL
+
+```bash
+curl --request POST \
+  --url 'https://api.agilereceivables.com/api/v1/external/statements/1c5a.../campaign?campaign_id=8f2c...' \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx'
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "Statement enrolled in campaign",
+  "data": {
+    "campaign_id": "...",
+    "enrolled_count": 1,
+    "skipped_count": 0,
+    "results": [
+      {
+        "customer_id": "...",
+        "invoice_id": "1c5a...",
+        "execution_id": "...",
+        "status": "enrolled"
+      }
+    ]
+  }
+}
+```
+
+The shape of each `results[]` entry mirrors `POST /external/accounts/{id}/campaign` — treat the
+inner object as opaque per-customer enrollment metadata.
+
+### Errors
+
+| Status | Cause                                                                                       |
+| ------ | ------------------------------------------------------------------------------------------- |
+| 400    | Sandbox key, statement has no customer, or campaign category is not `statement_acknowledgement`. |
+| 403    | API key lacks `statements:write` scope.                                                     |
+| 404    | Statement not found.                                                                        |
+
+## Bulk-enroll statements into an SA campaign
+
+`POST /api/v1/external/statements/campaign/bulk` enrolls up to **100** statements into one SA
+campaign. Per-statement failures don't abort the batch — they're returned in `skipped_errors`.
+
+- **Scope:** `statements:write`
+- **Sandbox keys are blocked.**
+
+### Request body — `ExternalStatementCampaignAssignRequest`
+
+| Field           | Type           | Required | Description                                       |
+| --------------- | -------------- | -------- | ------------------------------------------------- |
+| `campaign_id`   | UUID           | yes      | Must be an SA-category campaign.                  |
+| `statement_ids` | UUID[] (1-100) | yes      | Statement invoice UUIDs to enroll.                |
+
+```json
+{
+  "campaign_id": "8f2c...",
+  "statement_ids": [
+    "1c5a...",
+    "2d6b...",
+    "3e7c..."
+  ]
+}
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "message": "3 statements enrolled in campaign",
+  "data": {
+    "campaign_id": "8f2c...",
+    "enrolled_count": 3,
+    "skipped_count": 0,
+    "results": [ /* per-statement enrollment metadata */ ],
+    "skipped_errors": [
+      { "statement_id": "...", "error": "Statement not found" }
+    ]
+  }
+}
+```
+
+`skipped_errors` is omitted when there are none.
+
+### Errors
+
+| Status | Cause                                                                                  |
+| ------ | -------------------------------------------------------------------------------------- |
+| 400    | Sandbox key, no valid statements in batch, or SA-category guard failed.                |
+| 403    | API key lacks `statements:write` scope.                                                |
+
+## End-to-end flow
+
+A typical third-party integration looks like this:
+
+1. **Push customers** (existing endpoint, scope `customers:write`).
+
+   ```http
+   POST /api/v1/external/customers/bulk
+   { "customers": [ { "external_id": "PT-001", "first_name": "Alice", ... } ] }
+   ```
+
+2. **Push ledger entries** (scope `ledgers:write`). The response includes `statements.created: 1`
+   for the May 2026 statement.
+
+   ```http
+   POST /api/v1/external/ledgers/bulk
+   { "ledger_entries": [
+       { "external_id": "TX-1", "customer_external_id": "PT-001",
+         "transaction_date": "2026-05-03", "transaction_type": "charge",
+         "amount": 240 },
+       { "external_id": "TX-2", "customer_external_id": "PT-001",
+         "transaction_date": "2026-05-15", "transaction_type": "patient_payment",
+         "amount": -100 }
+   ] }
+   ```
+
+3. **(Optional) Read back** (scope `statements:read`). The response shows the auto-created
+   `STMT-2026-05-PT-001` with `amount=240, paid_amount=100, outstanding=140`.
+
+   ```http
+   GET /api/v1/external/statements?customer_external_id=PT-001
+   ```
+
+4. **Enroll into SA campaign** (scope `statements:write`, **live key only**). The statement moves
+   to `status="in_progress"` and the SA campaign starts running its workflow against the patient.
+
+   ```http
+   POST /api/v1/external/statements/{statement_id}/campaign?campaign_id={sa_campaign_uuid}
+   ```
+
+## Known limitations
+
+- **No `POST /external/campaigns`** — campaign creation is not exposed on the External API. SA
+  campaigns must be created in-app.
+- **No auto-enrollment** — pushing ledger entries creates statements but does not enroll them;
+  enrollment is always an explicit second call.
+- **No `PUT`/`DELETE` on statements** — statements are derived from ledger entries. To remove or
+  change a statement, modify the underlying ledger entries and re-push via the
+  [Ledgers API](/accounts/apis/ledgers).
+- **Sandbox keys cannot enroll into campaigns** — campaigns send real communications, so we only
+  allow enrollment from live keys.
