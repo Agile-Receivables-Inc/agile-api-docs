@@ -1,0 +1,193 @@
+import { Callout } from 'nextra-theme-docs'
+
+# Customer Notes API
+
+Use the Customer Notes API to attach freeform notes to a customer record. Notes capture collector
+remarks and system-generated events (payments, disputes, integrations) on a customer's timeline.
+
+<Callout type="info">
+  Notes created through the External API are always stamped with the `integration` source and the
+  calling API key's prefix (`source_id`), so third parties cannot masquerade as manual collector
+  notes.
+</Callout>
+
+## Authentication
+
+Authenticate with an `X-Api-Key` header. Scope behavior and empty-scope full-access rules are
+documented in **Core Concepts → Authentication**.
+
+| Scope            | Permission                       |
+| ---------------- | -------------------------------- |
+| `customers:read` | List and export notes.           |
+| `customers:write`| Create a note on a customer.     |
+
+Sandbox isolation matches the rest of the External API: test keys (`sk_test_*`) only access notes
+on sandbox customers, and live keys only access notes on live customers. A customer that doesn't
+match your key's mode returns `404`.
+
+## Endpoints
+
+All paths are relative to `https://api.agilereceivables.com/api/v1`.
+
+| Method | Path                                      | Scope            | Description                             |
+| ------ | ----------------------------------------- | ---------------- | --------------------------------------- |
+| POST   | `/external/customers/{customer_id}/notes` | `customers:write`| Add a note to a customer.               |
+| GET    | `/external/customers/{customer_id}/notes` | `customers:read` | List notes with pagination and sorting. |
+| GET    | `/external/customers/{customer_id}/notes/export` | `customers:read` | Export all notes as a CSV payload. |
+
+## Note fields
+
+| Field                | Type     | Description                                                                 |
+| -------------------- | -------- | --------------------------------------------------------------------------- |
+| `id`                 | uuid     | Internal note UUID.                                                         |
+| `customer_id`        | uuid     | Customer the note belongs to.                                               |
+| `content`            | string   | Note text, up to 300 characters.                                            |
+| `source`             | string   | Always `integration` for notes created via the External API.                |
+| `source_id`          | string   | API key prefix that created the note, e.g. `sk_live_abcd`.                  |
+| `created_by_user_id` | string   | API key ID that created the note.                                           |
+| `created_by_name`    | string   | Label of the API key, or its prefix.                                        |
+| `created_at`         | datetime | UTC timestamp when the note was created.                                    |
+| `archived_at`        | datetime | UTC timestamp when the note was archived. Omitted while the note is active. |
+
+## Create a note
+
+### cURL
+
+```bash
+curl --request POST \
+  --url https://api.agilereceivables.com/api/v1/external/customers/<customer_id>/notes \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "content": "Spoke with the patient; payment promised by end of month."
+  }'
+```
+
+### Request fields
+
+| Field               | Type   | Required | Description                                                              |
+| ------------------- | ------ | -------- | ------------------------------------------------------------------------ |
+| `content`           | string | yes      | Note text. Max 300 characters. Cannot be empty or whitespace-only.       |
+
+`source` and `source_id` are not accepted in the request body — they are set server-side to
+`integration` and the API key prefix respectively.
+
+### Response
+
+Creating a note returns `201` with the created note object.
+
+```json
+{
+  "success": true,
+  "status_code": 201,
+  "message": "Note added successfully",
+  "data": {
+    "id": "<note_uuid>",
+    "customer_id": "<customer_uuid>",
+    "content": "Spoke with the patient; payment promised by end of month.",
+    "source": "integration",
+    "source_id": "sk_live_abcd",
+    "created_by_user_id": "<api_key_id>",
+    "created_by_name": "Production Sync",
+    "created_at": "2026-08-06T14:22:31Z"
+  }
+}
+```
+
+### Errors
+
+| Status | Cause                                                |
+| ------ | ---------------------------------------------------- |
+| 400    | Content is whitespace-only.                          |
+| 401    | Missing or invalid API key.                          |
+| 403    | API key lacks the `customers:write` scope.           |
+| 404    | Customer not found for this key's sandbox mode.      |
+| 422    | Invalid request body — content is missing, empty, longer than 300 characters, or unsupported fields were sent. |
+
+## List notes
+
+`GET /api/v1/external/customers/{customer_id}/notes`
+
+### Query parameters
+
+| Param              | Type     | Default | Description                                    |
+| ------------------ | -------- | ------- | ---------------------------------------------- |
+| `sort`             | string   | `desc`  | Sort order: `asc` or `desc` by `created_at`.   |
+| `page`             | integer  | `1`     | Page number, min 1.                            |
+| `per_page`         | integer  | `20`    | Notes per page, min 1, max 100.                |
+| `include_archived` | boolean  | `false` | Include archived notes.                        |
+
+### cURL
+
+```bash
+curl --request GET \
+  --url 'https://api.agilereceivables.com/api/v1/external/customers/<customer_id>/notes?page=1&per_page=20&sort=desc' \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx'
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "status_code": 200,
+  "message": "Notes retrieved",
+  "data": {
+    "items": [
+      {
+        "id": "<note_uuid>",
+        "customer_id": "<customer_uuid>",
+        "content": "Spoke with the patient; payment promised by end of month.",
+        "source": "integration",
+        "source_id": "sk_live_abcd",
+        "created_by_user_id": "<api_key_id>",
+        "created_by_name": "Production Sync",
+        "created_at": "2026-08-06T14:22:31Z"
+      }
+    ]
+  },
+  "meta": {
+    "page": 1,
+    "per_page": 20,
+    "total": 1,
+    "total_pages": 1
+  }
+}
+```
+
+Pagination behavior and the `meta` object are documented in **Core Concepts → Pagination**.
+
+## Export notes as CSV
+
+`GET /api/v1/external/customers/{customer_id}/notes/export` returns all notes (unpaged) as a CSV
+payload.
+
+- Query param `include_archived` (default `false`).
+- CSV columns: `Date`, `Time`, `Source`, `Sub Source`, `Customer Name`, `ID`, `Note Content`.
+- Timestamps are converted to `America/Chicago`: date in `mm/dd/yyyy`, time in `hh:mm AM/PM`.
+
+### cURL
+
+```bash
+curl --request GET \
+  --url 'https://api.agilereceivables.com/api/v1/external/customers/<customer_id>/notes/export' \
+  --header 'X-Api-Key: sk_live_xxxxxxxxxxxxxxxxxxxx'
+```
+
+### Response
+
+```json
+{
+  "filename": "Jane_Doe_notes.csv",
+  "content": "Date,Time,Source,Sub Source,Customer Name,ID,Note Content\n08/06/2026,09:22 AM,Integration,Sk Live Abcd,Jane Doe,sk_live_abcd,Spoke with the patient; payment promised by end of month.\n"
+}
+```
+
+`filename` is derived from the customer's name and external ID. `content` is the raw CSV text —
+write it to a file or parse it on the client side.
+
+## Known limitations
+
+- There is no update or delete endpoint — notes are append-only and archived internally.
+- Notes created via the External API are always `integration`-source; manual notes can only be
+  written through the dashboard.
